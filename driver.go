@@ -265,16 +265,19 @@ func (l *LinstorDriver) Get(req *volume.GetRequest) (*volume.GetResponse, error)
 		return nil, err
 	}
 	ctx := context.Background()
-	resourceDef, err := c.ResourceDefinitions.Get(ctx, req.Name)
-	if err != nil {
+	name := req.Name
+	resourceDef, err := c.ResourceDefinitions.Get(ctx, name)
+	if err == nil {
+		if resourceDef.Props[pluginFlagKey] != pluginFlagValue {
+			return nil, fmt.Errorf("Volume '%s' is not managed by this plugin", name)
+		}
+		name = resourceDef.Name
+	} else if l.mountPoint(name) == "" {
 		return nil, err
 	}
-	if resourceDef.Props[pluginFlagKey] != pluginFlagValue {
-		return nil, fmt.Errorf("Volume '%s' is not managed by this plugin", req.Name)
-	}
 	vol := &volume.Volume{
-		Name:       resourceDef.Name,
-		Mountpoint: l.mountPoint(resourceDef.Name),
+		Name:       name,
+		Mountpoint: l.mountPoint(name),
 	}
 	return &volume.GetResponse{vol}, nil
 }
@@ -380,7 +383,7 @@ func (l *LinstorDriver) Mount(req *volume.MountRequest) (*volume.MountResponse, 
 func (l *LinstorDriver) Unmount(req *volume.UnmountRequest) error {
 	target := l.realMountPath(req.Name)
 	notMounted, err := l.mounter.IsNotMountPoint(target)
-	if err != nil || notMounted {
+	if (err != nil || notMounted) && !mount.IsCorruptedMnt(err) {
 		return err
 	}
 	if err = l.mounter.Unmount(target); err != nil {
@@ -429,7 +432,7 @@ func (l *LinstorDriver) reportedMountPath(name string) string {
 func (l *LinstorDriver) mountPoint(name string) string {
 	path := l.realMountPath(name)
 	notMounted, err := l.mounter.IsNotMountPoint(path)
-	if err != nil || notMounted {
+	if (err != nil || notMounted) && !mount.IsCorruptedMnt(err) {
 		return ""
 	}
 	return l.reportedMountPath(name)
