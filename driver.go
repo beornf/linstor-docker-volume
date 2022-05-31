@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	linstor "github.com/LINBIT/golinstor"
 	"github.com/LINBIT/golinstor/client"
@@ -77,28 +80,127 @@ func NewLinstorDriver(config, node, root string) *LinstorDriver {
 	}
 }
 
-func (l *LinstorDriver) newBaseURL(hosts string) (*url.URL, error) {
-	scheme := "http"
-	host := "localhost:3370"
-	if hosts != "" {
-		host = strings.Split(hosts, ",")[0]
-		if s := strings.Split(host, "://"); len(s) == 2 {
-			if s[0] == "linstor+ssl" || s[0] == "https" {
-				scheme = "https"
+const defaultHost = "localhost"
+
+func (l *LinstorDriver) tryConnect(urls []*url.URL) (*url.URL, []error) {
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	errChan := make(chan error)
+	indexChan := make(chan int)
+	doneChan := make(chan bool)
+	wg.Add(len(urls))
+	for i := range urls {
+		i := i
+		go func() {
+			defer wg.Done()
+			conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", urls[i].Host)
+			if err != nil {
+				errChan <- err
+				return
 			}
-			host = s[1]
-		}
+			cancel()
+			conn.Close()
+			indexChan <- i
+		}()
 	}
 
-	if !strings.Contains(host, ":") {
-		switch scheme {
-		case "http":
-			host += ":3370"
-		case "https":
-			host += ":3371"
+	go func() {
+		wg.Wait()
+		doneChan <- true
+	}()
+
+	var errs []error
+	for {
+		select {
+		case result := <-indexChan:
+			return urls[result], nil
+		case err := <-errChan:
+			errs = append(errs, err)
+		case <-doneChan:
+			return nil, errs
 		}
 	}
-	return url.Parse(scheme + "://" + host)
+}
+
+func getScheme(urlSplit []string) string {
+	if urlSplit[0] == "https" || urlSplit[0] == "linstor+ssl" {
+		return "https"
+	}
+	return "http"
+}
+
+func defaultPort(scheme string) string {
+	if scheme == "https" {
+		return "3371"
+	}
+	return "3370"
+}
+
+func (l *LinstorDriver) parseBaseURL(urlString string) (*url.URL, error) {
+	// Check scheme
+	urlSplit := strings.Split(urlString, "://")
+
+	if len(urlSplit) == 1 {
+		if urlSplit[0] == "" {
+			urlSplit[0] = defaultHost
+		}
+		urlSplit = []string{getScheme(urlSplit), urlSplit[0]}
+	}
+
+	if len(urlSplit) != 2 {
+		return nil, fmt.Errorf("URL with multiple scheme separators. parts: %v", urlSplit)
+	}
+	scheme, endpoint := urlSplit[0], urlSplit[1]
+	if scheme == "linstor+ssl" {
+		scheme = "https"
+	}
+
+	// Check port
+	endpointSplit := strings.Split(endpoint, ":")
+	if len(endpointSplit) == 1 {
+		endpointSplit = []string{endpointSplit[0], defaultPort(scheme)}
+	}
+	if len(endpointSplit) != 2 {
+		return nil, fmt.Errorf("URL with multiple port separators. parts: %v", endpointSplit)
+	}
+	host, port := endpointSplit[0], endpointSplit[1]
+
+	return url.Parse(fmt.Sprintf("%s://%s:%s", scheme, host, port))
+}
+
+func (l *LinstorDriver) parseURLs(urls string) ([]*url.URL, error) {
+	var result []*url.URL
+	for _, controller := range strings.Split(urls, ",") {
+		url, err := l.parseBaseURL(controller)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, url)
+	}
+
+	return result, nil
+}
+
+func (l *LinstorDriver) findRespondingController(controllers []*url.URL) (*url.URL, error) {
+	switch num := len(controllers); {
+	case num > 1:
+		url, errors := l.tryConnect(controllers)
+		if errors != nil {
+			log.Println("Unable to connect to any of the given controller hosts:")
+			for _, e := range errors {
+				log.Printf("   - %v", e)
+			}
+		}
+		if len(controllers) <= len(errors) {
+			return nil, fmt.Errorf("Could not connect to any controller: \n %q ", errors)
+		}
+		return url, nil
+	case num == 1:
+		return controllers[0], nil
+	default:
+		return nil, fmt.Errorf("No controller to connect to")
+	}
 }
 
 func (l *LinstorDriver) newClient() (*client.Client, error) {
@@ -115,7 +217,14 @@ func (l *LinstorDriver) newClient() (*client.Client, error) {
 		return nil, err
 	}
 
-	baseURL, err := l.newBaseURL(config.Controllers)
+	baseURLs, err := l.parseURLs(config.Controllers)
+
+	if err != nil {
+		return nil, err
+	}
+
+	baseURL, err := l.findRespondingController(baseURLs)
+
 	if err != nil {
 		return nil, err
 	}
@@ -346,7 +455,7 @@ func (l *LinstorDriver) Mount(req *volume.MountRequest) (*volume.MountResponse, 
 		return nil, err
 	}
 	if inUse {
-		return nil, fmt.Errorf("unable to get exclusive open on %s", source)
+		return nil, fmt.Errorf("Unable to get exclusive open on %s", source)
 	}
 	target := l.realMountPath(req.Name)
 	if err = l.mounter.MakeDir(target); err != nil {
