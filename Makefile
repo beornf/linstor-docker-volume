@@ -10,14 +10,14 @@ clean:
 
 docker:
 	@echo "### docker build: builder image"
-	@docker buildx build --platform linux/${PLUGIN_ARCH} -t builder -f Dockerfile.dev .
+	@docker buildx build --load --platform linux/${PLUGIN_ARCH} -t builder -f Dockerfile.dev .
 	@echo "### extract linstor-docker-volume"
 	@docker create --platform linux/${PLUGIN_ARCH} --name tmp builder
 	@docker cp tmp:/go/bin/linstor-docker-volume .
 	@docker rm -vf tmp
 	@docker rmi builder
 	@echo "### docker build: rootfs image with linstor-docker-volume"
-	@docker buildx build --platform linux/${PLUGIN_ARCH} -t ${PLUGIN_NAME}:rootfs .
+	@docker buildx build --load --platform linux/${PLUGIN_ARCH} -t ${PLUGIN_NAME}:rootfs .
 	@rm ./linstor-docker-volume
 
 rootfs:
