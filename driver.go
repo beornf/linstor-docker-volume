@@ -341,20 +341,23 @@ func (l *LinstorDriver) Mount(req *volume.MountRequest) (*volume.MountResponse, 
 		return nil, err
 	}
 	source := vol.DevicePath
-	inUse, err := l.mounter.DeviceOpened(source)
+	_, err = l.mounter.DeviceOpened(source)
 	if err != nil {
 		return nil, err
-	}
-	if inUse {
-		return nil, fmt.Errorf("unable to get exclusive open on %s", source)
 	}
 	target := l.realMountPath(req.Name)
 	if err = l.mounter.MakeDir(target); err != nil {
 		return nil, err
 	}
-	err = l.mounter.Mount(source, target, fstype, params.MountOpts)
+	needsMount, err := l.mounter.IsNotMountPoint(target)
 	if err != nil {
 		return nil, err
+	}
+	if needsMount {
+		err = l.mounter.Mount(source, target, fstype, params.MountOpts)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	mnt := l.reportedMountPath(req.Name)
